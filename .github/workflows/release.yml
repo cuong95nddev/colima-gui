@@ -1,3 +1,5 @@
+# Push a tag like v0.1.0 to build a universal, signed and notarized macOS DMG
+# and publish it as a GitHub release (the tag must match Cargo.toml's version).
 name: Release
 
 on:
@@ -6,53 +8,103 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   macos:
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust (arm64 + x86_64)
-        run: |
-          rustup update stable
-          rustup default stable
-          rustup target add aarch64-apple-darwin x86_64-apple-darwin
-
-      - uses: actions/cache@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-
-      - name: Build universal app bundle
-        run: UNIVERSAL=1 scripts/bundle.sh
-
-      - name: Package
-        id: pkg
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      # Not for a tagged release: a cache written by another run would go into
+      # the binary users download.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+      - name: Check tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          ZIP="Colima-GUI-${VERSION}-macos-universal.zip"
-          cd target/bundle
-          ditto -c -k --keepParent "Colima GUI.app" "../../$ZIP"
-          cd ../..
-          shasum -a 256 "$ZIP" > "$ZIP.sha256"
-          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/upload-artifact@v4
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "::error::tag $GITHUB_REF_NAME != Cargo.toml v$v"; exit 1; }
+      # Signing and notarization run only when the secrets are set (see README);
+      # without them a manual run builds an ad hoc signed app, and a tagged
+      # release fails rather than publish one.
+      - name: Import signing certificate and notary key
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          SIGN_ID: ${{ secrets.MACOS_SIGN_ID }}
+          NOTARY_KEY: ${{ secrets.NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
+        run: |
+          if [ -z "$CERT_P12" ] || [ -z "$NOTARY_KEY" ]; then
+            case "$GITHUB_REF" in
+              refs/tags/*) echo "::error::a release must be signed and notarized: set MACOS_CERT_P12 and NOTARY_KEY"; exit 1 ;;
+            esac
+            [ -n "$CERT_P12" ] || { echo "no signing secrets: ad hoc build"; exit 0; }
+          fi
+          KC="$RUNNER_TEMP/sign.keychain-db"
+          KC_PASS=$(openssl rand -hex 16)
+          security create-keychain -p "$KC_PASS" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KC_PASS" "$KC"
+          fail() { echo "::error::$1"; exit 1; }
+          printf '%s' "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12" 2>/dev/null ||
+            fail "MACOS_CERT_P12 isn't base64 (make it with: base64 -i cert.p12 | pbcopy)"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "$CERT_PASSWORD" -T /usr/bin/codesign ||
+            fail "couldn't import MACOS_CERT_P12: MACOS_CERT_PASSWORD is wrong, or it isn't a .p12 with the private key"
+          rm "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KC_PASS" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          ids=$(security find-identity -v -p codesigning "$KC")
+          printf '%s\n' "$ids" | grep -qF "\"$SIGN_ID\"" ||
+            fail "MACOS_SIGN_ID isn't an identity in MACOS_CERT_P12, which has: $(printf '%s' "$ids" | sed -n 's/.*"\(.*\)".*/\1/p' | paste -sd ';' -)"
+          echo "COLIMA_SIGN_ID=$SIGN_ID" >> "$GITHUB_ENV"
+          if [ -n "$NOTARY_KEY" ]; then
+            printf '%s' "$NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8" 2>/dev/null ||
+              fail "NOTARY_KEY isn't base64 (make it with: base64 -i AuthKey_XXXX.p8 | pbcopy)"
+            grep -q "BEGIN PRIVATE KEY" "$RUNNER_TEMP/notary.p8" ||
+              fail "NOTARY_KEY isn't a .p8 key once decoded"
+            key_id=$(printf '%s' "$NOTARY_KEY_ID" | tr -d '[:space:]')
+            issuer=$(printf '%s' "$NOTARY_ISSUER" | tr -d '[:space:]')
+            xcrun notarytool store-credentials colima-notary --keychain "$KC" \
+              --key "$RUNNER_TEMP/notary.p8" --key-id "$key_id" ${issuer:+--issuer "$issuer"} ||
+              fail "Apple refused the notary key (NOTARY_KEY_ID is ${#key_id} characters, NOTARY_ISSUER ${#issuer}; a team key's ID is 10 and its issuer 36, an individual key has no issuer)"
+            rm "$RUNNER_TEMP/notary.p8"
+            echo "COLIMA_NOTARY_PROFILE=colima-notary" >> "$GITHUB_ENV"
+            echo "COLIMA_NOTARY_KEYCHAIN=$KC" >> "$GITHUB_ENV"
+          fi
+      - name: Build DMG
+        id: dmg
+        run: |
+          dmg=$(scripts/release.sh dist)
+          echo "path=$dmg" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: colima-gui-macos
-          path: Colima-GUI-*.zip*
+          path: ${{ steps.dmg.outputs.path }}
 
-      - name: Create GitHub release
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" \
-            "${{ steps.pkg.outputs.zip }}" "${{ steps.pkg.outputs.zip }}.sha256" \
-            --title "Colima GUI $GITHUB_REF_NAME" \
-            --generate-notes
+  publish:
+    needs: [macos]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          pattern: colima-gui-*
+          merge-multiple: true
+          path: dist
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          files: dist/*.dmg
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          body: |
+            ## Install (macOS 11+, Apple Silicon and Intel)
+
+            1. Open the DMG and drag **Colima GUI** onto **Applications**.
+            2. Open it. If Colima isn't installed yet, the app walks you through `brew install colima docker`.

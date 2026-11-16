@@ -1,6 +1,8 @@
 #!/bin/sh
 # Build "Colima GUI.app" into target/bundle/.
 #   UNIVERSAL=1 scripts/bundle.sh   → arm64 + x86_64 universal binary (used by CI)
+# COLIMA_SIGN_ID: a "Developer ID Application: ..." identity → signed for distribution
+# (hardened runtime + secure timestamp, as notarization requires); otherwise ad hoc.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -51,6 +53,9 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
-# Ad-hoc signature (no Apple Developer ID).
-codesign --force --sign - "$APP"
+if [ -n "${COLIMA_SIGN_ID:-}" ]; then
+  codesign --force --options runtime --timestamp --sign "$COLIMA_SIGN_ID" "$APP" >&2
+else
+  codesign --force --sign - "$APP" >&2
+fi
 echo "$APP"

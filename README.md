@@ -26,15 +26,9 @@
 
 ## Install
 
-1. Download `Colima-GUI-<version>-macos-universal.zip` from the
+1. Download `Colima-GUI-<version>-macos-universal.dmg` from the
    [latest release](https://github.com/cuong95nddev/colima-gui/releases/latest) (Apple Silicon and Intel).
-2. Unzip it and move **Colima GUI.app** to `/Applications`.
-3. The app is not notarized by Apple, so the first launch is blocked by Gatekeeper. Either
-   right-click the app → **Open**, or run:
-
-   ```sh
-   xattr -dr com.apple.quarantine "/Applications/Colima GUI.app"
-   ```
+2. Open it and drag **Colima GUI** onto **Applications**. The app is signed and notarized by Apple.
 
 Requires macOS 11 or later. Colima itself is installed with `brew install colima docker`
 (the app offers to do this for you on first launch).
@@ -55,11 +49,26 @@ Requires macOS 11 or later. Colima itself is installed with `brew install colima
 cargo run --release          # run it
 scripts/install.sh           # build "Colima GUI.app" and copy it to /Applications
 UNIVERSAL=1 scripts/bundle.sh  # universal (arm64 + x86_64) bundle in target/bundle/
+scripts/release.sh             # universal DMG in dist/
 ```
 
 The app talks to Docker through `~/.colima/default/docker.sock` (or `DOCKER_HOST`) and to Colima through its CLI.
 
 ## Releasing
 
-Push a tag like `v0.1.0`; the [Release workflow](.github/workflows/release.yml) builds the universal app,
-zips it and publishes a GitHub release.
+Bump `version` in `Cargo.toml`, then push a matching tag (`v0.1.0`). The
+[Release workflow](.github/workflows/release.yml) builds a universal app, signs it with a
+Developer ID, notarizes and staples the app and the DMG, and publishes a GitHub release.
+
+It needs these repository secrets (Settings ▸ Secrets and variables ▸ Actions):
+
+| Secret | Value |
+| --- | --- |
+| `MACOS_CERT_P12` | Developer ID Application certificate + private key, exported as .p12, base64: `base64 -i cert.p12 \| pbcopy` |
+| `MACOS_CERT_PASSWORD` | the .p12 export password |
+| `MACOS_SIGN_ID` | the identity name, e.g. `Developer ID Application: Name (TEAMID)` |
+| `NOTARY_KEY` | App Store Connect API key (.p8), base64: `base64 -i AuthKey_XXXX.p8 \| pbcopy` |
+| `NOTARY_KEY_ID` | the API key's ID (10 characters) |
+| `NOTARY_ISSUER` | the issuer ID (team keys only) |
+
+Locally, `COLIMA_SIGN_ID=… COLIMA_NOTARY_PROFILE=… scripts/release.sh` does the same.
