@@ -45,7 +45,7 @@ fn fmt_age(ts: i64) -> String {
     }
 }
 
-fn container_name(c: &ContainerSummary) -> String {
+pub(crate) fn container_name(c: &ContainerSummary) -> String {
     c.names
         .as_ref()
         .and_then(|n| n.first())
@@ -57,11 +57,11 @@ fn short_id(id: &str) -> String {
     id.trim_start_matches("sha256:").chars().take(12).collect()
 }
 
-fn container_state(c: &ContainerSummary) -> String {
+pub(crate) fn container_state(c: &ContainerSummary) -> String {
     c.state.map(|s| s.to_string()).unwrap_or_default()
 }
 
-fn compose_project(c: &ContainerSummary) -> String {
+pub(crate) fn compose_project(c: &ContainerSummary) -> String {
     c.labels.as_ref().and_then(|l| l.get("com.docker.compose.project").cloned()).unwrap_or_default()
 }
 
@@ -80,7 +80,7 @@ fn image_label(c: &ContainerSummary) -> String {
 }
 
 /// "Exited (255) 3 minutes ago" → "Exited 3 minutes ago"
-fn short_status(c: &ContainerSummary) -> String {
+pub(crate) fn short_status(c: &ContainerSummary) -> String {
     let s = c.status.clone().unwrap_or_default();
     match (s.find(" ("), s.find(") ")) {
         (Some(a), Some(b)) if a < b => format!("{}{}", &s[..a], &s[b + 1..]),
@@ -108,7 +108,7 @@ fn split_tag(s: &str) -> (String, String) {
 
 
 /// Open a shell in the container in Terminal.app. Returns false when the docker CLI is missing.
-fn open_shell(id: &str) -> bool {
+pub(crate) fn open_shell(id: &str) -> bool {
     let Some(docker) = backend::which("docker") else { return false };
     let home = std::env::var("HOME").unwrap_or_default();
     run_in_terminal(&format!(
@@ -962,7 +962,8 @@ impl App {
         if groups.is_empty() {
             return empty_state(ui, Icon::Search, "No matches", &format!("Nothing matches “{}”.", self.filter));
         }
-        let single = groups.len() == 1;
+        // Hide the header only when everything is standalone; a compose project always gets its name shown.
+        let single = groups.len() == 1 && groups.keys().all(|(standalone, _)| *standalone);
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
             ui.add_space(4.0);
